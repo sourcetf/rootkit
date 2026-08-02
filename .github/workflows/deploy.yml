@@ -1,4 +1,4 @@
-name: Boot.img → GhostLock KernelSU Jailbreak → GitHub Pages
+name: GhostLock KernelSU Builder
 
 on:
   workflow_dispatch:
@@ -7,15 +7,11 @@ on:
         description: 'Boot.img direct download URL'
         required: true
       xbl_config_url:
-        description: 'xbl_config.img URL (optional, for better offset accuracy)'
+        description: 'xbl_config.img URL (optional)'
         required: false
         default: ''
       vendor_boot_url:
-        description: 'vendor_boot.img URL (optional, for MTK or GKI2 devices)'
-        required: false
-        default: ''
-      kernel_base:
-        description: 'Kernel base address hex (optional, auto-detect if empty)'
+        description: 'vendor_boot.img URL (optional, for MTK/GKI2)'
         required: false
         default: ''
 
@@ -32,103 +28,24 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+      - uses: actions/checkout@v4
 
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y binutils-aarch64-linux-gnu p7zip-full curl file jq
-          pip install vmlinux-to-elf pyelftools
+          sudo apt-get install -y binutils-aarch64-linux-gnu curl file
+          pip install vmlinux-to-elf pyelftools 2>/dev/null || true
 
       - name: Download images
         run: |
           mkdir -p images
           curl -fsSL --retry 3 --retry-delay 5 -o images/boot.img "${{ github.event.inputs.bootimg_url }}"
-          ls -la images/boot.img
-          file images/boot.img
-          if [ -n "${{ github.event.inputs.xbl_config_url }}" ]; then
-            curl -fsSL --retry 3 -o images/xbl_config.img "${{ github.event.inputs.xbl_config_url }}"
-          fi
-          if [ -n "${{ github.event.inputs.vendor_boot_url }}" ]; then
-            curl -fsSL --retry 3 -o images/vendor_boot.img "${{ github.event.inputs.vendor_boot_url }}"
-          fi
+          [ -n "${{ github.event.inputs.xbl_config_url }}" ] && curl -fsSL --retry 3 -o images/xbl_config.img "${{ github.event.inputs.xbl_config_url }}"
+          [ -n "${{ github.event.inputs.vendor_boot_url }}" ] && curl -fsSL --retry 3 -o images/vendor_boot.img "${{ github.event.inputs.vendor_boot_url }}"
 
-      - name: Auto-detect device name
+      - name: Detect device name
         id: detect
-        run: |
-          # Method 1: strings grep ro.product.device
-          DEVICE=$(strings images/boot.img 2>/dev/null | grep -oE 'ro\.product\.device=[^[:space:]]+' | head -n1 | cut -d= -f2)
-          if [ -z "$DEVICE" ]; then
-            # Method 2: grep ro.build.product
-            DEVICE=$(strings images/boot.img 2>/dev/null | grep -oE 'ro\.build\.product=[^[:space:]]+' | head -n1 | cut -d= -f2)
-          fi
-          if [ -z "$DEVICE" ]; then
-            # Method 3: boot.img header name field (16 bytes at offset 0x30)
-            DEVICE=$(dd if=images/boot.img bs=1 skip=48 count=16 2>/dev/null | strings | head -n1 | tr -dc 'a-zA-Z0-9_-')
-          fi
-          if [ -z "$DEVICE" ]; then
-            # Method 4: dtb compatible string
-            mkdir -p /tmp/dtb_extract
-            python3 -c "
-import os, struct
-with open('images/boot.img','rb') as f:
-    hdr = f.read(2048)
-    if hdr[:8] == b'ANDROID!':
-        ks = struct.unpack('<I', hdr[8:12])[0]
-        ps = struct.unpack('<I', hdr[36:40])[0]
-        f.seek(ps)
-        kernel = f.read(ks)
-        with open('/tmp/dtb_extract/k.gz','wb') as o: o.write(kernel)
-    else:
-        with open('/tmp/dtb_extract/k.gz','wb') as o: o.write(f.read())
-" 2>/dev/null || true
-            gzip -dc /tmp/dtb_extract/k.gz > /tmp/dtb_extract/kernel_raw 2>/dev/null || true
-            if [ -f /tmp/dtb_extract/kernel_raw ]; then
-              strings /tmp/dtb_extract/kernel_raw 2>/dev/null | grep -oE 'compatible[[:space:]]*=[[:space:]]*"[^"]+"' | head -n1 | sed 's/.*"\([^,]*\).*/\1/' | tr -dc 'a-zA-Z0-9_-' > /tmp/dtb_extract/dev.txt || true
-              DEVICE=$(cat /tmp/dtb_extract/dev.txt 2>/dev/null)
-            fi
-          fi
-          if [ -z "$DEVICE" ]; then
-            DEVICE="unknown-$(sha256sum images/boot.img | cut -c1-8)"
-          fi
-          DEVICE=$(echo "$DEVICE" | tr '[:upper:]' '[:lower:]' | tr -dc 'a-z0-9_-')
-          echo "Detected device: $DEVICE"
-          echo "device=$DEVICE" >> "$GITHUB_OUTPUT"
-
-      - name: Clone CVE-2026-43499-root-KernelSU
-        run: |
-          git clone --depth 1 https://github.com/woshimaniubi8/CVE-2026-43499-root-KernelSU.git jailbreak
-          ls jailbreak/
-          ls -la jailbreak/build/embed/ksud 2>/dev/null || echo "[!] ksud blob missing"
-
-      - name: Generate target.h
-        run: |
-          cd jailbreak
-          DEVICE="${{ steps.detect.outputs.device }}"
-          mkdir -p "src/targets/$DEVICE"
-          pip install -r tools/requirements.txt 2>/dev/null || true
-          GEN_CMD="python3 tools/generate_target.py --project $DEVICE --boot ../images/boot.img"
-          if [ -f "../images/xbl_config.img" ]; then
-            GEN_CMD="$GEN_CMD --xbl-config ../images/xbl_config.img"
-          fi
-          if [ -f "../images/vendor_boot.img" ]; then
-            GEN_CMD="$GEN_CMD --mtk-vendor-boot ../images/vendor_boot.img"
-          fi
-          if [ -n "${{ github.event.inputs.kernel_base }}" ]; then
-            GEN_CMD="$GEN_CMD --kernel-base ${{ github.event.inputs.kernel_base }}"
-          fi
-          echo "Running: $GEN_CMD"
-          $GEN_CMD || {
-            echo "[!] Fallback to rodin template"
-            TARGET_TEMPLATE=rodin $GEN_CMD --template-target rodin
-          }
-          head -n 30 "src/targets/$DEVICE/target.h" || true
+        run: bash scripts/detect-device.sh images/boot.img
 
       - name: Setup Android NDK
         uses: nttld/setup-ndk@v1
@@ -136,156 +53,20 @@ with open('images/boot.img','rb') as f:
           ndk-version: r27c
           link-to-sdk: true
 
-      - name: Build preload.so
+      - name: Clone source and build
         env:
           NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
           ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
-        run: |
-          cd jailbreak
-          DEVICE="${{ steps.detect.outputs.device }}"
-          make PROJECT="$DEVICE" -j$(nproc)
-          ls -la "build/$DEVICE/bin/preload.so"
-          cp "build/$DEVICE/bin/preload.so" ../preload.so
-          cp "src/targets/$DEVICE/target.h" ../target.h
+        run: bash scripts/build.sh "${{ steps.detect.outputs.device }}"
 
-      - name: Prepare GitHub Pages
-        run: |
-          DEVICE="${{ steps.detect.outputs.device }}"
-          mkdir -p _site
-          cp preload.so "_site/preload-${DEVICE}.so"
-          cp target.h "_site/target-${DEVICE}.h"
-          SHA=$(sha256sum preload.so | cut -d' ' -f1)
-          cat > _site/index.html << 'HTMLEOF'
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>🔓 GhostLock KernelSU</title>
-<style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{background:#0a0a0f;color:#e8e8f0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Noto Sans SC',sans-serif;min-height:100vh;line-height:1.6}
-.container{max-width:720px;margin:0 auto;padding:40px 20px}
-header{text-align:center;margin-bottom:40px}
-.badge{display:inline-block;background:rgba(102,126,234,.15);color:#a5b4fc;border:1px solid rgba(102,126,234,.3);padding:4px 14px;border-radius:20px;font-size:.8rem;margin-bottom:12px}
-h1{font-size:2.2rem;background:linear-gradient(90deg,#667eea,#764ba2,#f093fb);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:8px}
-.subtitle{color:#6b7280;font-size:.95rem}
-.card{background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.06);border-radius:16px;padding:28px;margin-bottom:20px}
-.card h2{font-size:1.15rem;color:#fff;margin-bottom:16px;display:flex;align-items:center;gap:8px}
-.code-block{background:#11131a;border:1px solid rgba(255,255,255,.08);border-radius:10px;padding:16px;font-family:'SF Mono',Monaco,monospace;font-size:.82rem;color:#a5b4fc;overflow-x:auto;position:relative}
-.code-block pre{margin:0;white-space:pre-wrap;word-break:break-all}
-.copy-btn{position:absolute;top:10px;right:10px;background:rgba(255,255,255,.08);border:none;color:#a5b4fc;padding:4px 10px;border-radius:6px;font-size:.75rem;cursor:pointer;transition:.2s}
-.copy-btn:hover{background:rgba(102,126,234,.25);color:#fff}
-.btn{display:block;width:100%;text-align:center;background:linear-gradient(135deg,#667eea,#764ba2);color:#fff;text-decoration:none;padding:14px;border-radius:10px;font-weight:600;margin-bottom:10px;transition:.2s;border:none;cursor:pointer;font-size:.95rem}
-.btn:hover{transform:translateY(-1px);box-shadow:0 8px 24px rgba(102,126,234,.3)}
-.btn-secondary{background:linear-gradient(135deg,#11998e,#38ef7d)}
-.btn-secondary:hover{box-shadow:0 8px 24px rgba(17,153,142,.3)}
-.btn-danger{background:linear-gradient(135deg,#eb3349,#f45c43)}
-.steps{margin:0;padding-left:20px}
-.steps li{margin-bottom:10px;color:#b0b3c7;font-size:.9rem}
-.steps li strong{color:#e8e8f0}
-.warning{background:rgba(245,158,11,.08);border-left:3px solid #f59e0b;padding:16px;border-radius:0 10px 10px 0;margin:20px 0;font-size:.85rem;color:#d4d4d8}
-.warning strong{color:#fbbf24}
-footer{text-align:center;margin-top:40px;color:#4b5563;font-size:.75rem}
-.device-info{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px}
-.info-item{background:rgba(255,255,255,.02);padding:10px 14px;border-radius:8px;font-size:.82rem}
-.info-item span{display:block;color:#6b7280;font-size:.7rem;text-transform:uppercase;letter-spacing:.5px;margin-bottom:2px}
-.info-item code{color:#a5b4fc;font-family:monospace}
-</style>
-</head>
-<body>
-<div class="container">
-<header>
-<div class="badge">GhostLock + KernelSU</div>
-<h1>🔓 <span id="devName">Loading...</span></h1>
-<p class="subtitle">一键越狱模式 · late-load KernelSU</p>
-</header>
-
-<div class="card">
-<h2>📱 设备信息</h2>
-<div class="device-info">
-<div class="info-item"><span>设备代号</span><code id="dCode">-</code></div>
-<div class="info-item"><span>Payload</span><code>preload.so</code></div>
-<div class="info-item"><span>模式</span><code>KernelSU late-load</code></div>
-<div class="info-item"><span>SHA256</span><code id="dHash">-</code></div>
-</div>
-</div>
-
-<div class="card">
-<h2>⚡ 一键越狱</h2>
-<p style="color:#b0b3c7;font-size:.85rem;margin-bottom:14px">在已开启 USB 调试的设备上执行：</p>
-<div class="code-block">
-<button class="copy-btn" onclick="copy(this)">复制</button>
-<pre id="cmd">adb push preload.so /data/local/tmp/preload.so
-adb shell 'chmod 755 /data/local/tmp/preload.so'
-adb shell 'LD_PRELOAD=/data/local/tmp/preload.so /system/bin/toybox id'</pre>
-</div>
-<a class="btn" id="dlSo" href="#" download>⬇️ 下载 preload.so</a>
-<a class="btn btn-secondary" href="https://github.com/tiann/KernelSU/releases" target="_blank">📥 下载 KernelSU 管理器</a>
-</div>
-
-<div class="card">
-<h2>📋 使用步骤</h2>
-<ol class="steps">
-<li><strong>安装 KernelSU 管理器 APK</strong>（无需提前 root）</li>
-<li><strong>开启 USB 调试</strong>，连接电脑</li>
-<li><strong>执行上方 adb 命令</strong>，等待利用完成</li>
-<li>成功后打开 KernelSU 管理器，授予 root 权限</li>
-<li>享受 root 环境（无需解锁 Bootloader）</li>
-</ol>
-<div class="warning">
-<strong>⚠️ 风险提示</strong><br>
-利用失败会导致 kernel panic → 自动重启，不会损坏设备。偏移由自动化脚本提取，可能存在误差。建议在备用机上测试。仅供安全研究，使用者自行承担风险。
-</div>
-</div>
-
-<div class="card">
-<h2>🔧 高级选项</h2>
-<div class="code-block">
-<button class="copy-btn" onclick="copy(this)">复制</button>
-<pre># 自定义 KernelSU 包名
-adb shell 'KSUD_PACKAGE=com.example.manager LD_PRELOAD=/data/local/tmp/preload.so /system/bin/toybox id'
-
-# 跳过 ksud 写出
-adb shell 'KSUD_SKIP_WRITE=1 LD_PRELOAD=/data/local/tmp/preload.so /system/bin/toybox id'
-
-# 查看日志
-adb shell 'cat /data/local/tmp/ksud.log /data/local/tmp/ksud.preload.log'</pre>
-</div>
-<a class="btn btn-danger" id="dlH" href="#" download>⬇️ 下载 target.h（调试用）</a>
-</div>
-
-<footer>
-<p>基于 <a href="https://github.com/woshimaniubi8/CVE-2026-43499-root-KernelSU" style="color:#667eea">CVE-2026-43499-root-KernelSU</a></p>
-<p style="margin-top:4px">仅供安全研究与学习用途</p>
-</footer>
-</div>
-<script>
-const d=new URLSearchParams(location.search).get('device')||'unknown';
-const hash=location.hash.slice(1)||'';
-document.getElementById('devName').textContent=d;
-document.getElementById('dCode').textContent=d;
-document.getElementById('dHash').textContent=hash?hash.slice(0,16)+'...':'-';
-document.getElementById('dlSo').href='preload-'+d+'.so';
-document.getElementById('dlSo').download='preload-'+d+'.so';
-document.getElementById('dlH').href='target-'+d+'.h';
-document.getElementById('dlH').download='target-'+d+'.h';
-function copy(btn){
-  const pre=btn.parentElement.querySelector('pre');
-  navigator.clipboard.writeText(pre.innerText).then(()=>{btn.textContent='已复制';setTimeout(()=>btn.textContent='复制',1500)});
-}
-</script>
-</body>
-</html>
-HTMLEOF
-          sed -i "s|Loading...|$DEVICE|g" _site/index.html
-          sed -i "s|-|$(echo $SHA | cut -c1-16)...|g" _site/index.html
+      - name: Generate GitHub Pages site
+        run: bash scripts/generate-site.sh "${{ steps.detect.outputs.device }}"
 
       - name: Setup Pages
         uses: actions/configure-pages@v5
 
-      - name: Upload Pages artifact
+      - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
           path: '_site'
