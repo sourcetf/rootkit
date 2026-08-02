@@ -36,19 +36,31 @@ jobs:
           sudo apt-get install -y binutils-aarch64-linux-gnu curl file
           pip install vmlinux-to-elf pyelftools 2>/dev/null || true
 
-#      - name: Download images
+      - name: Download images
 #        run: |
      #     mkdir -p images
    #       curl -fsSL --retry 3 --retry-delay 5 -o images/boot.img "${{ github.event.inputs.bootimg_url }}"
  #         [ -n "${{ github.event.inputs.xbl_config_url }}" ] && curl -fsSL --retry 3 -o images/xbl_config.img "${{ github.event.inputs.xbl_config_url }}"
- #         [ -n "${{ github.event.inputs.vendor_boot_url }}" ] && curl -fsSL --retry 3 -o images/vendor_boot.img "${{ github.event.inputs.vendor_boot_url }}"
-      - name: Download images
-        run: |
-          mkdir -p images
-          wget -q -O images/boot.img "${{ github.event.inputs.bootimg_url }}"
-          [ -n "${{ github.event.inputs.xbl_config_url }}" ] && wget -q -O images/xbl_config.img "${{ github.event.inputs.xbl_config_url }}" || true
-          [ -n "${{ github.event.inputs.vendor_boot_url }}" ] && wget -q -O images/vendor_boot.img "${{ github.event.inputs.vendor_boot_url }}" || true
+ #         [ -n "${{ github.event.inputs.vendor_boot_url }}" ] && curl -fsSL --retry 3 -o images/vendor_boot.img "${{ github.event.inputs.vendor_boot
 
+#     - name: Download images
+         run: |
+          mkdir -p images
+          echo "=== boot.img ==="
+          wget -O images/boot.img "${{ github.event.inputs.bootimg_url }}"
+          ls -la images/boot.img
+          
+          if [ -n "${{ github.event.inputs.xbl_config_url }}" ]; then
+            echo "=== xbl_config.img ==="
+            wget -O images/xbl_config.img "${{ github.event.inputs.xbl_config_url }}" || echo "[!] xbl_config download failed, continuing"
+          fi
+          
+          if [ -n "${{ github.event.inputs.vendor_boot_url }}" ]; then
+            echo "=== vendor_boot.img ==="
+            wget -O images/vendor_boot.img "${{ github.event.inputs.vendor_boot_url }}" || echo "[!] vendor_boot download failed, continuing"
+          fi
+     
+      
       - name: Detect device name
         id: detect
         run: bash scripts/detect-device.sh images/boot.img
