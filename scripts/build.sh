@@ -14,10 +14,18 @@ GEN="python3 tools/generate_target.py --project $DEVICE --boot ../images/boot.im
 [ -f "../images/xbl_config.img" ] && GEN="$GEN --xbl-config ../images/xbl_config.img"
 [ -f "../images/vendor_boot.img" ] && GEN="$GEN --mtk-vendor-boot ../images/vendor_boot.img"
 
-$GEN || {
-  echo "[!] Fallback to rodin template"
-  TARGET_TEMPLATE=rodin $GEN --template-target rodin
-}
+echo "First attempt: $GEN"
+if $GEN; then
+    echo "[+] generate_target.py succeeded"
+else
+    echo "[!] First attempt failed, retrying without xbl_config..."
+    GEN="python3 tools/generate_target.py --project $DEVICE --boot ../images/boot.img"
+    [ -f "../images/vendor_boot.img" ] && GEN="$GEN --mtk-vendor-boot ../images/vendor_boot.img"
+    $GEN || {
+        echo "[!] Second attempt also failed. Trying bare boot.img only..."
+        python3 tools/generate_target.py --project $DEVICE --boot ../images/boot.img
+    }
+fi
 
 echo "Building preload.so..."
 make PROJECT="$DEVICE" -j$(nproc)
