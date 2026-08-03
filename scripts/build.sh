@@ -9,94 +9,136 @@ cd jailbreak
 
 echo "=== Inspecting reference target.h ==="
 REF_TARGET=$(find . -name "target.h" -not -path "./.git/*" | head -n1)
-[ -n "$REF_TARGET" ] && { echo "Reference: $REF_TARGET"; head -n 40 "$REF_TARGET"; } || echo "[*] No reference found"
+[ -n "$REF_TARGET" ] && { echo "Reference: $REF_TARGET"; head -n 30 "$REF_TARGET"; } || echo "[*] No reference found"
 
-echo "=== Extracting kernel from boot.img ==="
+echo "=== Parsing boot.img ==="
 mkdir -p /tmp/kextract
 
 python3 << PYEOF
 import struct, sys
 
 with open("$WORKSPACE/images/boot.img", 'rb') as f:
-    header = f.read(4096)
-    
-    if header[:8] != b'ANDROID!':
-        print("ERROR: Not a valid boot.img")
-        sys.exit(1)
-    
-    kernel_size = struct.unpack('<I', header[8:12])[0]
-    header_size = struct.unpack('<I', header[0x0c:0x10])[0]
-    
-    if header_size == 0:
-        page_size = struct.unpack('<I', header[36:40])[0]
-        hdr_sz = page_size
-    elif header_size in (1232, 1580):
-        hdr_sz = header_size
-    else:
-        page_size = struct.unpack('<I', header[36:40])[0]
-        hdr_sz = page_size if page_size >= 2048 else 4096
-    
-    print(f"[+] Header size: {hdr_sz}, Kernel size: {kernel_size}")
-    f.seek(hdr_sz)
+    hdr = f.read(4096)
+
+assert hdr[:8] == b'ANDROID!', "Not a valid boot.img"
+
+kernel_size = struct.unpack('<I', hdr[8:12])[0]
+
+# Detect version: v3/v4 have header_size=1580 @ offset 20
+header_size = struct.unpack('<I', hdr[20:24])[0]
+if header_size == 1580:
+    # v3/v4: kernel starts RIGHT AFTER header (not page-aligned!)
+    page_size = struct.unpack('<Q', hdr[56:64])[0]
+    if page_size == 0:
+        page_size = 4096
+    kernel_offset = header_size
+    ver = "v3/v4"
+elif header_size == 1660:
+    # v2
+    page_size = struct.unpack('<I', hdr[36:40])[0]
+    kernel_offset = header_size
+    ver = "v2"
+else:
+    # v0/v1
+    page_size = struct.unpack('<I', hdr[36:40])[0]
+    if page_size == 0:
+        page_size = 2048
+    kernel_offset = page_size
+    ver = "v0/v1"
+
+print(f"[+] {ver} boot.img: header_size={header_size}, page_size={page_size}, kernel @ {kernel_offset}, size={kernel_size}")
+
+with open("$WORKSPACE/images/boot.img", 'rb') as f:
+    f.seek(kernel_offset)
     kernel = f.read(kernel_size)
-    
-    with open('/tmp/kextract/kernel.gz', 'wb') as o:
-        o.write(kernel)
-    print(f"[+] Extracted {len(kernel)} bytes")
+
+print(f"[+] Extracted {len(kernel)} bytes")
+first = kernel[:16]
+print(f"[+] First 16 bytes: {first.hex()}")
+
+# Save raw kernel
+with open('/tmp/kextract/kernel', 'wb') as o:
+    o.write(kernel)
+
+# Try to identify compression
+if first[:2] == b'\x1f\x8b':
+    print("[+] Detected: gzip")
+elif first[:4] == b'\x04\x22\x4d\x18':
+    print("[+] Detected: lz4 frame")
+elif first[:2] == b'\x02\x21':
+    print("[+] Detected: lz4 legacy")
+elif first[:4] == b'\x28\xb5\x2f\xfd':
+    print("[+] Detected: zstd")
+elif first[:6] == b'\xfd\x37\x7a\x58\x5a\x00':
+    print("[+] Detected: xz")
+elif first[:4] == b'\x7fELF':
+    print("[+] Detected: ELF (uncompressed vmlinux)")
+else:
+    print(f"[!] Unknown/unsupported compression: {first[:8].hex()}")
 PYEOF
 
 cd /tmp/kextract
 
-echo "=== Attempt 1: extract-vmlinux (Linux official script) ==="
-if ! command -v extract-vmlinux >/dev/null 2>&1; then
-    curl -fsSL -o extract-vmlinux https://raw.githubusercontent.com/torvalds/linux/master/scripts/extract-vmlinux
-    chmod +x extract-vmlinux
+echo "=== Attempt 1: vmlinux-to-elf ==="
+python3 -c "
+from vmlinux_to_elf.extract_vmlinux import extract_vmlinux
+extract_vmlinux('/tmp/kextract/kernel', '/tmp/kextract/vmlinux')
+" 2>/dev/null && { echo "[+] vmlinux-to-elf success"; VMLINUX_OK=1; } || { echo "[!] vmlinux-to-elf failed"; VMLINUX_OK=0; }
+
+if [ "$VMLINUX_OK" != "1" ]; then
+    echo "=== Attempt 2: extract-vmlinux (Linux official) ==="
+    curl -fsSL -o extract-vmlinux https://raw.githubusercontent.com/torvalds/linux/master/scripts/extract-vmlinux 2>/dev/null
+    chmod +x extract-vmlinux 2>/dev/null || true
+    if [ -x ./extract-vmlinux ]; then
+        ./extract-vmlinux /tmp/kextract/kernel > /tmp/kextract/vmlinux 2>/dev/null && [ -s /tmp/kextract/vmlinux ] && { echo "[+] extract-vmlinux success"; VMLINUX_OK=1; } || echo "[!] extract-vmlinux failed"
+    fi
 fi
 
-if ./extract-vmlinux kernel.gz > vmlinux 2>/dev/null && [ -s vmlinux ]; then
-    echo "[+] extract-vmlinux succeeded"
-else
-    echo "[!] extract-vmlinux failed"
-    
-    echo "=== Attempt 2: manual decompression ==="
+if [ "$VMLINUX_OK" != "1" ]; then
+    echo "=== Attempt 3: manual decompression ==="
+    # Try each tool based on magic
+    FIRST=$(xxd -l 4 -p /tmp/kextract/kernel)
     SUCCESS=0
-    for tool in gzip lz4 zstd xz; do
-        if command -v $tool >/dev/null 2>&1; then
-            echo "  Trying $tool..."
-            if $tool -dc kernel.gz > kernel.raw 2>/dev/null && [ -s kernel.raw ]; then
-                echo "  [+] Decompressed with $tool"
-                SUCCESS=1
-                break
-            fi
-        fi
-    done
     
-    if [ "$SUCCESS" != "1" ]; then
+    case "$FIRST" in
+        1f8b*)
+            echo "Trying gzip..."
+            gzip -dc /tmp/kextract/kernel > /tmp/kextract/vmlinux 2>/dev/null && SUCCESS=1
+            ;;
+        04224d18)
+            echo "Trying lz4 frame..."
+            lz4 -dc /tmp/kextract/kernel > /tmp/kextract/vmlinux 2>/dev/null && SUCCESS=1
+            ;;
+        0221*)
+            echo "Trying lz4 legacy..."
+            lz4 -d -l /tmp/kextract/kernel /tmp/kextract/vmlinux 2>/dev/null && SUCCESS=1
+            ;;
+        28b52ffd)
+            echo "Trying zstd..."
+            zstd -dc /tmp/kextract/kernel > /tmp/kextract/vmlinux 2>/dev/null && SUCCESS=1
+            ;;
+        fd377a*)
+            echo "Trying xz..."
+            xz -dc /tmp/kextract/kernel > /tmp/kextract/vmlinux 2>/dev/null && SUCCESS=1
+            ;;
+        7f454c46)
+            echo "Already ELF..."
+            cp /tmp/kextract/kernel /tmp/kextract/vmlinux && SUCCESS=1
+            ;;
+    esac
+    
+    if [ "$SUCCESS" = "1" ] && [ -s /tmp/kextract/vmlinux ]; then
+        echo "[+] Manual decompression success"
+        VMLINUX_OK=1
+    else
         echo "[!] All decompression failed"
+        echo "=== Kernel hex dump (first 64 bytes) ==="
+        xxd -l 64 /tmp/kextract/kernel
         exit 1
     fi
-    
-    echo "=== Checking kernel.raw format ==="
-    file kernel.raw
-    
-    if file kernel.raw | grep -q ELF; then
-        cp kernel.raw vmlinux
-        echo "[+] kernel.raw is ELF"
-    else
-        echo "[*] kernel.raw is raw binary, trying vmlinux-to-elf..."
-        python3 -c "
-from vmlinux_to_elf.extract_vmlinux import extract_vmlinux
-extract_vmlinux('/tmp/kextract/kernel.raw', '/tmp/kextract/vmlinux')
-" 2>/dev/null || true
-    fi
 fi
 
-if [ ! -f vmlinux ] || [ ! -s vmlinux ]; then
-    echo "[!] Failed to obtain vmlinux"
-    exit 1
-fi
-
-echo "[+] vmlinux ready, size: $(stat -c%s vmlinux)"
+echo "[+] vmlinux ready, size: $(stat -c%s /tmp/kextract/vmlinux 2>/dev/null || echo 0)"
 
 echo "=== Extracting kernel symbols ==="
 cd /tmp/kextract
