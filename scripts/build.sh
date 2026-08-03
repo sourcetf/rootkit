@@ -9,73 +9,102 @@ cd jailbreak
 
 echo "=== Inspecting reference target.h ==="
 REF_TARGET=$(find . -name "target.h" -not -path "./.git/*" | head -n1)
-[ -n "$REF_TARGET" ] && head -n 60 "$REF_TARGET" || echo "[*] No reference found, using generic format"
+[ -n "$REF_TARGET" ] && { echo "Reference: $REF_TARGET"; head -n 40 "$REF_TARGET"; } || echo "[*] No reference found"
 
-echo "=== Extracting vmlinux from boot.img ==="
+echo "=== Extracting kernel from boot.img ==="
 mkdir -p /tmp/kextract
-cd /tmp/kextract
 
-# 方法1: vmlinux-to-elf（变量正确展开）
-python3 -c "
-from vmlinux_to_elf.extract_vmlinux import extract_vmlinux
-extract_vmlinux('$WORKSPACE/images/boot.img', 'vmlinux')
-" 2>/dev/null || true
+python3 << PYEOF
+import struct, sys
 
-# 方法2: 手动解压（heredoc 用双引号确保变量展开）
-if [ ! -f vmlinux ] || [ "$(stat -c%s vmlinux 2>/dev/null || echo 0)" -lt 1000000 ]; then
-  echo "[!] vmlinux-to-elf failed, trying manual extraction..."
-  
-  python3 << PYEOF
-import struct, os, subprocess
-
-with open('$WORKSPACE/images/boot.img', 'rb') as f:
-    hdr = f.read(2048)
-    if hdr[:8] == b'ANDROID!':
-        ks = struct.unpack('<I', hdr[8:12])[0]
-        ps = struct.unpack('<I', hdr[36:40])[0]
-        f.seek(ps)
-        raw = f.read(ks)
+with open("$WORKSPACE/images/boot.img", 'rb') as f:
+    header = f.read(4096)
+    
+    if header[:8] != b'ANDROID!':
+        print("ERROR: Not a valid boot.img")
+        sys.exit(1)
+    
+    kernel_size = struct.unpack('<I', header[8:12])[0]
+    header_size = struct.unpack('<I', header[0x0c:0x10])[0]
+    
+    if header_size == 0:
+        page_size = struct.unpack('<I', header[36:40])[0]
+        hdr_sz = page_size
+    elif header_size in (1232, 1580):
+        hdr_sz = header_size
     else:
-        f.seek(0)
-        raw = f.read()
-    with open('/tmp/kextract/kernel_raw.gz', 'wb') as o:
-        o.write(raw)
-
-for cmd, name in [
-    ('gzip -dc /tmp/kextract/kernel_raw.gz > /tmp/kextract/kernel_raw 2>/dev/null', 'gzip'),
-    ('lz4 -dc /tmp/kextract/kernel_raw.gz > /tmp/kextract/kernel_raw 2>/dev/null', 'lz4'),
-    ('zstd -dc /tmp/kextract/kernel_raw.gz > /tmp/kextract/kernel_raw 2>/dev/null', 'zstd'),
-    ('xz -dc /tmp/kextract/kernel_raw.gz > /tmp/kextract/kernel_raw 2>/dev/null', 'xz'),
-]:
-    r = subprocess.run(cmd, shell=True)
-    if r.returncode == 0 and os.path.getsize('/tmp/kextract/kernel_raw') > 1000000:
-        print(f'[+] Decompressed with {name}')
-        break
-else:
-    import shutil
-    shutil.copy('/tmp/kextract/kernel_raw.gz', '/tmp/kextract/kernel_raw')
+        page_size = struct.unpack('<I', header[36:40])[0]
+        hdr_sz = page_size if page_size >= 2048 else 4096
+    
+    print(f"[+] Header size: {hdr_sz}, Kernel size: {kernel_size}")
+    f.seek(hdr_sz)
+    kernel = f.read(kernel_size)
+    
+    with open('/tmp/kextract/kernel.gz', 'wb') as o:
+        o.write(kernel)
+    print(f"[+] Extracted {len(kernel)} bytes")
 PYEOF
 
-  if file /tmp/kextract/kernel_raw | grep -q ELF; then
-    cp /tmp/kextract/kernel_raw /tmp/kextract/vmlinux
-  else
-    echo "[!] Manual extraction failed"
-    exit 1
-  fi
+cd /tmp/kextract
+
+echo "=== Attempt 1: extract-vmlinux (Linux official script) ==="
+if ! command -v extract-vmlinux >/dev/null 2>&1; then
+    curl -fsSL -o extract-vmlinux https://raw.githubusercontent.com/torvalds/linux/master/scripts/extract-vmlinux
+    chmod +x extract-vmlinux
 fi
 
-VMLINUX_SIZE=$(stat -c%s /tmp/kextract/vmlinux 2>/dev/null || echo 0)
-echo "[+] vmlinux extracted, size: $VMLINUX_SIZE"
+if ./extract-vmlinux kernel.gz > vmlinux 2>/dev/null && [ -s vmlinux ]; then
+    echo "[+] extract-vmlinux succeeded"
+else
+    echo "[!] extract-vmlinux failed"
+    
+    echo "=== Attempt 2: manual decompression ==="
+    SUCCESS=0
+    for tool in gzip lz4 zstd xz; do
+        if command -v $tool >/dev/null 2>&1; then
+            echo "  Trying $tool..."
+            if $tool -dc kernel.gz > kernel.raw 2>/dev/null && [ -s kernel.raw ]; then
+                echo "  [+] Decompressed with $tool"
+                SUCCESS=1
+                break
+            fi
+        fi
+    done
+    
+    if [ "$SUCCESS" != "1" ]; then
+        echo "[!] All decompression failed"
+        exit 1
+    fi
+    
+    echo "=== Checking kernel.raw format ==="
+    file kernel.raw
+    
+    if file kernel.raw | grep -q ELF; then
+        cp kernel.raw vmlinux
+        echo "[+] kernel.raw is ELF"
+    else
+        echo "[*] kernel.raw is raw binary, trying vmlinux-to-elf..."
+        python3 -c "
+from vmlinux_to_elf.extract_vmlinux import extract_vmlinux
+extract_vmlinux('/tmp/kextract/kernel.raw', '/tmp/kextract/vmlinux')
+" 2>/dev/null || true
+    fi
+fi
+
+if [ ! -f vmlinux ] || [ ! -s vmlinux ]; then
+    echo "[!] Failed to obtain vmlinux"
+    exit 1
+fi
+
+echo "[+] vmlinux ready, size: $(stat -c%s vmlinux)"
 
 echo "=== Extracting kernel symbols ==="
 cd /tmp/kextract
 
-# 内核基址
 KERNEL_BASE=$(aarch64-linux-gnu-nm vmlinux 2>/dev/null | grep ' T _text$' | awk '{print "0x"$1}' | head -n1)
 [ -z "$KERNEL_BASE" ] && KERNEL_BASE="0xffffffc008000000"
 echo "[+] Kernel base: $KERNEL_BASE"
 
-# 符号提取函数
 get_sym() {
     local name="$1"
     local addr=$(aarch64-linux-gnu-nm vmlinux 2>/dev/null | grep " [Tt] $name\$" | awk '{print "0x"$1}' | head -n1)
@@ -105,7 +134,6 @@ cd "$WORKSPACE/jailbreak"
 mkdir -p "src/targets/$DEVICE"
 
 cat > "src/targets/$DEVICE/target.h" << EOF
-/* Auto-generated target.h for $DEVICE */
 #ifndef TARGET_H
 #define TARGET_H
 
@@ -139,10 +167,10 @@ cat > "src/targets/$DEVICE/target.h" << EOF
 #define PIPE_BUF_OFFSET             0x40
 #define PIPE_BUF_OPS_OFFSET         0x58
 
-#endif /* TARGET_H */
+#endif
 EOF
 
-echo "[+] Generated target.h:"
+echo "[+] Generated target.h"
 cat "src/targets/$DEVICE/target.h"
 
 echo "=== Building preload.so ==="
