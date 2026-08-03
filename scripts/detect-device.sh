@@ -4,82 +4,96 @@ BOOTIMG="$1"
 
 echo "=== Detecting device from $BOOTIMG ==="
 
-# 方法1: strings 找常见 prop（有些设备确实在 boot.img 里）
+# 方法1: 常见 prop strings
 DEVICE=$(strings "$BOOTIMG" 2>/dev/null | grep -aoE 'ro\.product\.(device|name|board)=[^[:space:]]+' | head -n1 | cut -d= -f2)
 echo "[*] Method 1 (strings prop): ${DEVICE:-<not found>}"
 
-# 方法2: boot.img header name 字段（16字节 @ offset 0x30）
+# 方法2: boot.img header name
 if [ -z "$DEVICE" ]; then
   DEVICE=$(dd if="$BOOTIMG" bs=1 skip=48 count=16 2>/dev/null | strings | head -n1 | tr -dc 'a-zA-Z0-9_-')
   echo "[*] Method 2 (header name): ${DEVICE:-<not found>}"
 fi
 
-# 方法3: 从 dtb 提取 compatible（最可靠）
+# 方法3: 从 kernel 区域提取 DTB
 if [ -z "$DEVICE" ]; then
-  echo "[*] Method 3: Extracting DTB..."
+  echo "[*] Method 3: Extracting kernel & DTB..."
   mkdir -p /tmp/dtb_extract
   
-  # 用 python 提取 kernel 镜像（支持变量展开）
   python3 << PYEOF
 import struct
 with open("$BOOTIMG", 'rb') as f:
-    hdr = f.read(2048)
-    if hdr[:8] == b'ANDROID!':
-        ks = struct.unpack('<I', hdr[8:12])[0]
-        ps = struct.unpack('<I', hdr[36:40])[0]
-        f.seek(ps)
-        with open('/tmp/dtb_extract/k.gz', 'wb') as o:
-            o.write(f.read(ks))
+    header = f.read(4096)
+    if header[:8] != b'ANDROID!':
+        print("[-] Not a valid boot.img")
+        exit(0)
+    
+    kernel_size = struct.unpack('<I', header[8:12])[0]
+    header_size = struct.unpack('<I', header[0x0c:0x10])[0]
+    
+    if header_size == 0:
+        page_size = struct.unpack('<I', header[36:40])[0]
+        hdr_sz = page_size
+    elif header_size in (1232, 1580):
+        hdr_sz = header_size
     else:
-        f.seek(0)
-        with open('/tmp/dtb_extract/k.gz', 'wb') as o:
-            o.write(f.read())
+        page_size = struct.unpack('<I', header[36:40])[0]
+        hdr_sz = page_size if page_size >= 2048 else 4096
+    
+    print(f"[+] Header size: {hdr_sz}, Kernel size: {kernel_size}")
+    f.seek(hdr_sz)
+    kernel = f.read(kernel_size)
+    
+    # Search DTB magic from end of kernel (appended dtb)
+    magic = b'\xd0\x0d\xfe\xed'
+    idx = kernel.rfind(magic)
+    if idx >= 0:
+        size = struct.unpack('>I', kernel[idx+4:idx+8])[0]
+        with open('/tmp/dtb_extract/dtb', 'wb') as o:
+            o.write(kernel[idx:idx+size])
+        print(f"[+] Found DTB at kernel offset {idx}")
+    else:
+        print("[-] No DTB in kernel")
 PYEOF
 
-  # 尝试解压 kernel
-  for cmd in "gzip -dc" "lz4 -dc" "zstd -dc" "xz -dc"; do
-    if $cmd /tmp/dtb_extract/k.gz > /tmp/dtb_extract/kernel_raw 2>/dev/null; then
-      [ -s /tmp/dtb_extract/kernel_raw ] && { echo "[+] Decompressed kernel with $cmd"; break; }
-    fi
-  done
+  if [ -f /tmp/dtb_extract/dtb ]; then
+    DEVICE=$(strings /tmp/dtb_extract/dtb 2>/dev/null | grep -oE ',[a-zA-Z0-9_-]+' | head -n1 | tr -d ',')
+    echo "[*] Method 3 (DTB compatible): ${DEVICE:-<not found>}"
+  fi
+fi
 
-  if [ -s /tmp/dtb_extract/kernel_raw ]; then
-    # 搜索 DTB magic (0xd00dfeed) 并提取
-    python3 << PYEOF
+# 方法4: 在整个 boot.img 中搜索 DTB（dtb 可能在单独区域）
+if [ -z "$DEVICE" ]; then
+  echo "[*] Method 4: Full boot.img DTB search..."
+  python3 << PYEOF
 import struct
-with open('/tmp/dtb_extract/kernel_raw', 'rb') as f:
+with open("$BOOTIMG", 'rb') as f:
     data = f.read()
     magic = b'\xd0\x0d\xfe\xed'
     idx = data.find(magic)
     if idx >= 0:
         size = struct.unpack('>I', data[idx+4:idx+8])[0]
-        with open('/tmp/dtb_extract/dtb', 'wb') as o:
+        with open('/tmp/dtb_extract/dtb2', 'wb') as o:
             o.write(data[idx:idx+size])
-        print(f'[+] Found DTB at offset {idx}, size {size}')
-    else:
-        print('[-] DTB magic not found in kernel')
+        print(f"[+] Found DTB at boot.img offset {idx}")
 PYEOF
-
-    if [ -f /tmp/dtb_extract/dtb ]; then
-      # 从 dtb 提取 compatible 字符串（取第一个逗号前的部分）
-      DEVICE=$(strings /tmp/dtb_extract/dtb 2>/dev/null | grep -oE ',[a-zA-Z0-9_-]+' | head -n1 | tr -d ',')
-      echo "[*] Method 3 (DTB compatible): ${DEVICE:-<not found>}"
-    fi
+  if [ -f /tmp/dtb_extract/dtb2 ]; then
+    DEVICE=$(strings /tmp/dtb_extract/dtb2 2>/dev/null | grep -oE ',[a-zA-Z0-9_-]+' | head -n1 | tr -d ',')
+    echo "[*] Method 4 (DTB compatible): ${DEVICE:-<not found>}"
   fi
 fi
 
-# 方法4: 从 kernel 的 __efistub 或内置 cmdline 找
+# 方法5: cmdline
 if [ -z "$DEVICE" ]; then
-  DEVICE=$(strings "$BOOTIMG" 2>/dev/null | grep -oE 'androidboot\.device=[^[:space:]]+' | head -n1 | cut -d= -f2)
-  echo "[*] Method 4 (cmdline): ${DEVICE:-<not found>}"
+  DEVICE=$(strings "$BOOTIMG" 2>/dev/null | grep -oE 'androidboot\.(device|hardware)=[^[:space:]]+' | head -n1 | cut -d= -f2)
+  echo "[*] Method 5 (cmdline): ${DEVICE:-<not found>}"
 fi
 
-# 方法5: hash fallback
+# Fallback
 if [ -z "$DEVICE" ]; then
   DEVICE="unknown-$(sha256sum "$BOOTIMG" | cut -c1-8)"
-  echo "[!] Method 5 (hash fallback): $DEVICE"
+  echo "[!] Fallback (hash): $DEVICE"
 fi
 
 DEVICE=$(echo "$DEVICE" | tr '[:upper:]' '[:lower:]' | tr -dc 'a-z0-9_-')
-echo "[+] Final detected device: $DEVICE"
+echo "[+] Final device: $DEVICE"
 echo "device=$DEVICE" >> "$GITHUB_OUTPUT"
